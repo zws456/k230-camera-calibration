@@ -32,15 +32,17 @@ from libs.AIBase import AIBase
 from libs.AI2D import Ai2d
 from libs.Utils import *
 
-# ============================================================
-# 标定参数（来自 camera_intrinsic.yaml，1920x1080 标定）
-# ============================================================
-CALIB_FX = 1623.7143
-CALIB_FY = 1622.9086
-CALIB_CX = 915.0068
-CALIB_CY = 597.0911
-CALIB_WIDTH = 1920
-CALIB_HEIGHT = 1080
+# 导入标定参数（从 camera_intrinsic.yaml 自动生成）
+try:
+    from camera_config import CALIB_WIDTH, CALIB_HEIGHT, CALIB_FX, CALIB_FY, CALIB_CX, CALIB_CY
+except ImportError:
+    # 如果 camera_config.py 不存在，使用硬编码默认值
+    CALIB_FX = 1623.7143
+    CALIB_FY = 1622.9086
+    CALIB_CX = 915.0068
+    CALIB_CY = 597.0911
+    CALIB_WIDTH = 1920
+    CALIB_HEIGHT = 1080
 
 # ============================================================
 # 运行分辨率（可根据需要修改）
