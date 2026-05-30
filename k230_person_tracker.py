@@ -233,17 +233,17 @@ class PersonTrackerApp(AIBase):
     def compute_control(self, person_info):
         """
         根据目标位置计算底盘控制量。
-        返回: (vx, vy, omega)
+        当前只保留旋转控制（让人物在画面中心）和测距。
+        返回: (omega, distance)
         """
         if person_info is None:
             # 丢失目标，停止
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0
 
         cx = person_info['cx']
-        cy = person_info['cy']
         distance = person_info['distance']
 
-        # ---- 1. 旋转控制（让人物在画面水平中间）----
+        # ---- 旋转控制（让人物在画面水平中间）----
         error_x = cx - self.cx
         if abs(error_x) < DEADZONE_X:
             omega = 0.0
@@ -253,18 +253,7 @@ class PersonTrackerApp(AIBase):
             omega = -KP_YAW * normalized_x * MAX_OMEGA
             omega = clamp(omega, -MAX_OMEGA, MAX_OMEGA)
 
-        # ---- 2. 前进/后退控制（保持目标距离）----
-        error_dist = distance - TARGET_DISTANCE
-        if abs(error_dist) < DEADZONE_DIST:
-            vx = 0.0
-        else:
-            vx = KP_DIST * error_dist
-            vx = clamp(vx, -MAX_VX, MAX_VX)
-
-        # ---- 3. 左右平移（暂不使用）----
-        vy = VY
-
-        return vx, vy, omega
+        return omega, distance
 
     def draw_result(self, pl, person_info, dets):
         """绘制检测结果和跟踪信息到 OSD"""
@@ -297,10 +286,9 @@ class PersonTrackerApp(AIBase):
 
             # 绘制控制信息
             if person_info:
-                info_str = "Dist:%.2fm Omega:%.2f Vx:%.2f" % (
+                info_str = "Dist:%.2fm Omega:%.2f" % (
                     person_info['distance'],
-                    person_info.get('omega', 0),
-                    person_info.get('vx', 0)
+                    person_info.get('omega', 0)
                 )
                 pl.osd_img.draw_string_advanced(10, 10, 28, info_str, color=(255, 255, 255, 0))
             else:
@@ -371,19 +359,18 @@ def main():
             # 3. 找到最近的人体
             person_info = tracker.find_nearest_person(dets)
 
-            # 4. 计算底盘控制量
-            vx, vy, omega = tracker.compute_control(person_info)
+            # 4. 计算旋转控制量和距离
+            omega, distance = tracker.compute_control(person_info)
 
             # 更新 person_info 用于显示
             if person_info:
-                person_info['vx'] = vx
-                person_info['vy'] = vy
                 person_info['omega'] = omega
+                # 距离已在 find_nearest_person 中计算
 
-            # 5. UART 发送（固定频率）
+            # 5. UART 发送（固定频率，vx/vy 固定为 0）
             now = time.ticks_ms()
             if uart and time.ticks_diff(now, last_send_time) >= send_interval_ms:
-                frame = pack_uart_frame(vx, vy, omega)
+                frame = pack_uart_frame(0.0, 0.0, omega)
                 uart.write(frame)
                 last_send_time = now
 
