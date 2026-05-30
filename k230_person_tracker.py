@@ -172,8 +172,10 @@ class PersonTrackerKeypointApp(AIBase):
     def estimate_full_height(self, kps):
         """
         根据关键点推算全身像素高度。
-        利用人体解剖比例：头到髋≈全身×0.5，头到肩≈全身×0.3
+        返回 (estimated_height, method_string)
         """
+        img_h = self.rgb888p_size[1]
+
         # 找头部最上点
         head_y = None
         for idx in HEAD_KPS:
@@ -183,7 +185,11 @@ class PersonTrackerKeypointApp(AIBase):
                     head_y = y
 
         if head_y is None:
-            return None
+            return None, "no_head"
+
+        # 判断头部是否被画面顶部截断
+        # 如果最上方头部关键点的 y < 画面高度的 4%，认为头顶在画面外
+        head_cutoff = head_y < img_h * 0.04
 
         # 能看到髋部？
         hip_y = None
@@ -195,10 +201,13 @@ class PersonTrackerKeypointApp(AIBase):
 
         if hip_y is not None:
             # 头到髋 ≈ 全身 × 0.5
-            return (hip_y - head_y) * 2.0
+            return (hip_y - head_y) * 2.0, "hip"
 
         # 能看到肩膀？
         shoulder_y = None
+        left_shoulder = kps[KP_LEFT_SHOULDER]
+        right_shoulder = kps[KP_RIGHT_SHOULDER]
+
         for idx in SHOULDER_KPS:
             if kps[idx][2] > 0.15:
                 y = kps[idx][1]
@@ -206,8 +215,20 @@ class PersonTrackerKeypointApp(AIBase):
                     shoulder_y = y
 
         if shoulder_y is not None:
-            # 头到肩 ≈ 全身 × 0.3
-            return (shoulder_y - head_y) * 3.3
+            if head_cutoff:
+                # 头顶被截断，head_y 是鼻子/眼的位置，不是真正头顶
+                # 此时 (shoulder_y - head_y) 只代表"鼻到肩"，系数要更大
+                # 或者改用肩宽估算（更可靠）
+                if left_shoulder[2] > 0.15 and right_shoulder[2] > 0.15:
+                    shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
+                    # 肩宽 ≈ 全身 / 3.8，亚洲成年男性约 42cm/170cm
+                    return shoulder_width * 3.8, "shoulder_w"
+                else:
+                    # 只有一侧肩膀，用鼻到肩 × 5（头顶被截断时鼻到肩占比更小）
+                    return (shoulder_y - head_y) * 5.0, "shoulder_cut"
+            else:
+                # 头部完整可见，头到肩 ≈ 全身 × 0.3
+                return (shoulder_y - head_y) * 3.3, "shoulder"
 
         # 只有头部，用头高 × 8
         head_bottom_y = None
@@ -218,9 +239,9 @@ class PersonTrackerKeypointApp(AIBase):
                     head_bottom_y = y
 
         if head_bottom_y is not None:
-            return (head_bottom_y - head_y) * 8.0
+            return (head_bottom_y - head_y) * 8.0, "head_only"
 
-        return None
+        return None, "fail"
 
     def find_nearest_person(self, res):
         """
@@ -273,11 +294,12 @@ class PersonTrackerKeypointApp(AIBase):
         x1, y1, x2, y2 = best['bbox']
 
         # 用关键点估算全身高度
-        estimated_height = self.estimate_full_height(kps)
+        estimated_height, est_method = self.estimate_full_height(kps)
 
         # fallback 到检测框高度
         if estimated_height is None or estimated_height <= 0:
             estimated_height = y2 - y1
+            est_method = "bbox_fallback"
 
         # 测距
         distance = (PERSON_REAL_HEIGHT * self.fy) / estimated_height
@@ -289,7 +311,8 @@ class PersonTrackerKeypointApp(AIBase):
             'distance': distance,
             'cx': best['person_cx'],
             'estimated_height': estimated_height,
-            'bbox_height': y2 - y1
+            'bbox_height': y2 - y1,
+            'est_method': est_method
         }, best_idx
 
     def compute_control(self, person_info):
@@ -356,7 +379,8 @@ class PersonTrackerKeypointApp(AIBase):
                         # 显示推算信息
                         est_h = person_info['estimated_height']
                         bbox_h = person_info['bbox_height']
-                        info2 = "estH:%d bboxH:%d" % (int(est_h), int(bbox_h))
+                        method = person_info.get('est_method', '?')
+                        info2 = "%s estH:%d bboxH:%d" % (method, int(est_h), int(bbox_h))
                         pl.osd_img.draw_string_advanced(sx, sy - 80, 24, info2, color=(255, 255, 255, 0))
 
             # 画面中心十字
