@@ -225,39 +225,52 @@ class PersonTrackerKeypointApp(AIBase):
     def find_nearest_person(self, res):
         """
         从 pose 结果中找到距离画面中心最近的人体。
-        res: [detections, keypoints]
+        res: person_kp_postprocess 返回的结果
+        注意：res[0] 仅用于获取人数，不读取其具体格式（官方 API 中 det 格式不确定）
         """
         if not res or not res[0]:
             return None, -1
 
-        dets = res[0]
         kpses = res[1]
-        num = len(dets)
+        num = len(res[0])  # 人数
 
-        best_idx = -1
-        best_dist = float('inf')
-
+        # 从关键点计算每个人的边界框和中心，不依赖 res[0] 的检测框格式
+        persons = []
         for i in range(num):
             kps = kpses[i]
 
-            # 优先用 nose 位置作为人物中心
+            # 收集所有可见关键点
+            visible = [kp for kp in kps if kp[2] > 0.15]
+            if not visible:
+                continue
+
+            xs = [kp[0] for kp in visible]
+            ys = [kp[1] for kp in visible]
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+
+            # 优先用 nose 作为人物中心
             if kps[KP_NOSE][2] > 0.15:
                 person_cx = kps[KP_NOSE][0]
             else:
-                det = dets[i]
-                person_cx = (det[2] + det[4]) / 2.0
+                person_cx = (x1 + x2) / 2.0
 
             dist = abs(person_cx - self.cx)
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = i
+            persons.append({
+                'idx': i,
+                'kps': kps,
+                'bbox': [x1, y1, x2, y2],
+                'person_cx': person_cx,
+                'dist': dist
+            })
 
-        if best_idx < 0:
+        if not persons:
             return None, -1
 
-        det = dets[best_idx]
-        kps = kpses[best_idx]
-        x1, y1, x2, y2 = det[2], det[3], det[4], det[5]
+        # 找离画面中心最近的
+        best = min(persons, key=lambda p: p['dist'])
+        best_idx = best['idx']
+        kps = best['kps']
+        x1, y1, x2, y2 = best['bbox']
 
         # 用关键点估算全身高度
         estimated_height = self.estimate_full_height(kps)
@@ -269,18 +282,12 @@ class PersonTrackerKeypointApp(AIBase):
         # 测距
         distance = (PERSON_REAL_HEIGHT * self.fy) / estimated_height
 
-        # 人物中心 x
-        if kps[KP_NOSE][2] > 0.15:
-            person_cx = kps[KP_NOSE][0]
-        else:
-            person_cx = (x1 + x2) / 2.0
-
         return {
             'idx': best_idx,
-            'det': det,
             'kps': kps,
+            'bbox': best['bbox'],
             'distance': distance,
-            'cx': person_cx,
+            'cx': best['person_cx'],
             'estimated_height': estimated_height,
             'bbox_height': y2 - y1
         }, best_idx
@@ -336,10 +343,11 @@ class PersonTrackerKeypointApp(AIBase):
 
                     # 目标框和标签
                     if is_target and person_info:
-                        sx = int(det[2] * self.display_size[0] // self.rgb888p_size[0])
-                        sy = int(det[3] * self.display_size[1] // self.rgb888p_size[1])
-                        w = int((det[4] - det[2]) * self.display_size[0] // self.rgb888p_size[0])
-                        h = int((det[5] - det[3]) * self.display_size[1] // self.rgb888p_size[1])
+                        x1, y1, x2, y2 = person_info['bbox']
+                        sx = int(x1 * self.display_size[0] // self.rgb888p_size[0])
+                        sy = int(y1 * self.display_size[1] // self.rgb888p_size[1])
+                        w = int((x2 - x1) * self.display_size[0] // self.rgb888p_size[0])
+                        h = int((y2 - y1) * self.display_size[1] // self.rgb888p_size[1])
                         pl.osd_img.draw_rectangle(sx, sy, w, h, color=(255, 255, 0, 0), thickness=2)
 
                         label = "Dist:%.2fm" % person_info['distance']
