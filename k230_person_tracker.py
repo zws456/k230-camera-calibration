@@ -173,10 +173,15 @@ class PersonTrackerKeypointApp(AIBase):
         """
         根据关键点推算全身像素高度。
         返回 (estimated_height, method_string)
-        """
-        img_h = self.rgb888p_size[1]
 
-        # 找头部最上点
+        注意：COCO 关键点没有"头顶"点，head_y 取的是鼻子/眼/耳的最上方，
+        不是真正头顶。因此所有基于 head_y 的比例系数都要修正：
+        - 鼻尖到肩 ≈ 全身 × 0.18  → 系数 1/0.18 ≈ 5.5
+        - 鼻尖到髋 ≈ 全身 × 0.46  → 系数 1/0.46 ≈ 2.2
+        - 头高(鼻尖到下巴) ≈ 全身 × 0.09 → 系数 1/0.09 ≈ 11
+        - 肩宽 ≈ 全身 / 4.2
+        """
+        # 找头部最上点（鼻子/眼/耳的最上方，不是头顶）
         head_y = None
         for idx in HEAD_KPS:
             if kps[idx][2] > 0.15:
@@ -187,10 +192,6 @@ class PersonTrackerKeypointApp(AIBase):
         if head_y is None:
             return None, "no_head"
 
-        # 判断头部是否被画面顶部截断
-        # 如果最上方头部关键点的 y < 画面高度的 4%，认为头顶在画面外
-        head_cutoff = head_y < img_h * 0.04
-
         # 能看到髋部？
         hip_y = None
         for idx in HIP_KPS:
@@ -200,14 +201,19 @@ class PersonTrackerKeypointApp(AIBase):
                     hip_y = y
 
         if hip_y is not None:
-            # 头到髋 ≈ 全身 × 0.5
-            return (hip_y - head_y) * 2.0, "hip"
+            # 鼻尖到髋 ≈ 全身 × 0.46
+            return (hip_y - head_y) * 2.2, "hip"
 
-        # 能看到肩膀？
-        shoulder_y = None
+        # 能看到双肩？优先用肩宽（不受头部位置影响）
         left_shoulder = kps[KP_LEFT_SHOULDER]
         right_shoulder = kps[KP_RIGHT_SHOULDER]
+        if left_shoulder[2] > 0.15 and right_shoulder[2] > 0.15:
+            shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
+            # 肩宽 ≈ 全身 / 4.2
+            return shoulder_width * 4.2, "shoulder_w"
 
+        # 能看到单侧肩膀？
+        shoulder_y = None
         for idx in SHOULDER_KPS:
             if kps[idx][2] > 0.15:
                 y = kps[idx][1]
@@ -215,22 +221,10 @@ class PersonTrackerKeypointApp(AIBase):
                     shoulder_y = y
 
         if shoulder_y is not None:
-            if head_cutoff:
-                # 头顶被截断，head_y 是鼻子/眼的位置，不是真正头顶
-                # 此时 (shoulder_y - head_y) 只代表"鼻到肩"，系数要更大
-                # 或者改用肩宽估算（更可靠）
-                if left_shoulder[2] > 0.15 and right_shoulder[2] > 0.15:
-                    shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
-                    # 肩宽 ≈ 全身 / 3.8，亚洲成年男性约 42cm/170cm
-                    return shoulder_width * 3.8, "shoulder_w"
-                else:
-                    # 只有一侧肩膀，用鼻到肩 × 5（头顶被截断时鼻到肩占比更小）
-                    return (shoulder_y - head_y) * 5.0, "shoulder_cut"
-            else:
-                # 头部完整可见，头到肩 ≈ 全身 × 0.3
-                return (shoulder_y - head_y) * 3.3, "shoulder"
+            # 鼻尖到肩 ≈ 全身 × 0.18
+            return (shoulder_y - head_y) * 5.5, "shoulder"
 
-        # 只有头部，用头高 × 8
+        # 只有头部，用头高(鼻尖到下巴) × 11
         head_bottom_y = None
         for idx in HEAD_KPS:
             if kps[idx][2] > 0.15:
@@ -239,7 +233,7 @@ class PersonTrackerKeypointApp(AIBase):
                     head_bottom_y = y
 
         if head_bottom_y is not None:
-            return (head_bottom_y - head_y) * 8.0, "head_only"
+            return (head_bottom_y - head_y) * 11.0, "head_only"
 
         return None, "fail"
 
@@ -376,25 +370,28 @@ class PersonTrackerKeypointApp(AIBase):
                         label = "Dist:%.2fm" % person_info['distance']
                         pl.osd_img.draw_string_advanced(sx, sy - 40, 28, label, color=(255, 255, 0, 0))
 
-                        # 显示推算信息
-                        est_h = person_info['estimated_height']
-                        bbox_h = person_info['bbox_height']
-                        method = person_info.get('est_method', '?')
-                        info2 = "%s estH:%d bboxH:%d" % (method, int(est_h), int(bbox_h))
-                        pl.osd_img.draw_string_advanced(sx, sy - 80, 24, info2, color=(255, 255, 255, 0))
+                            # 显示推算信息（已移到左上角，避免目标框在顶部时出界）
+                        pass
 
             # 画面中心十字
             center_x = int(self.cx * self.display_size[0] // self.rgb888p_size[0])
             center_y = int(self.cy * self.display_size[1] // self.rgb888p_size[1])
             pl.osd_img.draw_cross(center_x, center_y, color=(255, 255, 255, 0), size=15, thickness=2)
 
-            # 控制信息
+            # 控制信息（左上角固定位置，不会出界）
             if person_info:
                 info_str = "Dist:%.2fm Omega:%.2f" % (
                     person_info['distance'],
                     person_info.get('omega', 0)
                 )
                 pl.osd_img.draw_string_advanced(10, 10, 28, info_str, color=(255, 255, 255, 0))
+
+                # 调试信息：估算高度 + 方法
+                est_h = person_info['estimated_height']
+                bbox_h = person_info['bbox_height']
+                method = person_info.get('est_method', '?')
+                debug_str = "%s estH:%d bboxH:%d" % (method, int(est_h), int(bbox_h))
+                pl.osd_img.draw_string_advanced(10, 45, 24, debug_str, color=(255, 255, 255, 0))
             else:
                 pl.osd_img.draw_string_advanced(10, 10, 28, "No person detected", color=(255, 255, 0, 0))
 
