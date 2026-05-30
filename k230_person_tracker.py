@@ -63,6 +63,9 @@ MODEL_INPUT_SIZE = [320, 320]
 CONFIDENCE_THRESHOLD = 0.2
 NMS_THRESHOLD = 0.5
 
+# 关键点置信度阈值：用于测距的关键点（头/肩/髋）score 必须高于此值
+MIN_KP_SCORE = 0.25
+
 # 关键点索引（COCO，0-based）
 KP_NOSE = 0
 KP_LEFT_EYE = 1
@@ -83,12 +86,17 @@ HIP_KPS = [KP_LEFT_HIP, KP_RIGHT_HIP]
 # ============================================================
 
 def pack_uart_frame(vx, vy, omega):
+    # 过滤非法浮点值，防止 UART 发送脏数据导致底盘解析错误
+    def _clean(v):
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            return 0.0
+        return float(v)
     data = bytearray(16)
     data[0] = 0xAA
     data[1] = 0x55
-    struct.pack_into('<f', data, 2, float(vx))
-    struct.pack_into('<f', data, 6, float(vy))
-    struct.pack_into('<f', data, 10, float(omega))
+    struct.pack_into('<f', data, 2, _clean(vx))
+    struct.pack_into('<f', data, 6, _clean(vy))
+    struct.pack_into('<f', data, 10, _clean(omega))
     data[14] = 0x0D
     data[15] = 0x0A
     return bytes(data)
@@ -184,7 +192,7 @@ class PersonTrackerKeypointApp(AIBase):
         # 找头部最上点（鼻子/眼/耳的最上方，不是头顶）
         head_y = None
         for idx in HEAD_KPS:
-            if kps[idx][2] > 0.15:
+            if kps[idx][2] > MIN_KP_SCORE:
                 y = kps[idx][1]
                 if head_y is None or y < head_y:
                     head_y = y
@@ -195,7 +203,7 @@ class PersonTrackerKeypointApp(AIBase):
         # 能看到髋部？
         hip_y = None
         for idx in HIP_KPS:
-            if kps[idx][2] > 0.15:
+            if kps[idx][2] > MIN_KP_SCORE:
                 y = kps[idx][1]
                 if hip_y is None or y > hip_y:
                     hip_y = y
@@ -207,7 +215,7 @@ class PersonTrackerKeypointApp(AIBase):
         # 能看到双肩？优先用肩宽（不受头部位置影响）
         left_shoulder = kps[KP_LEFT_SHOULDER]
         right_shoulder = kps[KP_RIGHT_SHOULDER]
-        if left_shoulder[2] > 0.15 and right_shoulder[2] > 0.15:
+        if left_shoulder[2] > MIN_KP_SCORE and right_shoulder[2] > MIN_KP_SCORE:
             shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
             # 肩宽 ≈ 全身 / 4.2
             return shoulder_width * 4.2, "shoulder_w"
@@ -215,7 +223,7 @@ class PersonTrackerKeypointApp(AIBase):
         # 能看到单侧肩膀？
         shoulder_y = None
         for idx in SHOULDER_KPS:
-            if kps[idx][2] > 0.15:
+            if kps[idx][2] > MIN_KP_SCORE:
                 y = kps[idx][1]
                 if shoulder_y is None or y > shoulder_y:
                     shoulder_y = y
@@ -227,7 +235,7 @@ class PersonTrackerKeypointApp(AIBase):
         # 只有头部，用头高(鼻尖到下巴) × 11
         head_bottom_y = None
         for idx in HEAD_KPS:
-            if kps[idx][2] > 0.15:
+            if kps[idx][2] > MIN_KP_SCORE:
                 y = kps[idx][1]
                 if head_bottom_y is None or y > head_bottom_y:
                     head_bottom_y = y
@@ -255,7 +263,7 @@ class PersonTrackerKeypointApp(AIBase):
             kps = kpses[i]
 
             # 收集所有可见关键点
-            visible = [kp for kp in kps if kp[2] > 0.15]
+            visible = [kp for kp in kps if kp[2] > MIN_KP_SCORE]
             if not visible:
                 continue
 
@@ -264,7 +272,7 @@ class PersonTrackerKeypointApp(AIBase):
             x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
 
             # 优先用 nose 作为人物中心
-            if kps[KP_NOSE][2] > 0.15:
+            if kps[KP_NOSE][2] > MIN_KP_SCORE:
                 person_cx = kps[KP_NOSE][0]
             else:
                 person_cx = (x1 + x2) / 2.0
@@ -287,16 +295,21 @@ class PersonTrackerKeypointApp(AIBase):
         kps = best['kps']
         x1, y1, x2, y2 = best['bbox']
 
-        # 用关键点估算全身高度
-        estimated_height, est_method = self.estimate_full_height(kps)
+        # === 全身检测：只有能看到髋部才计算距离 ===
+        has_hip = any(kps[idx][2] > MIN_KP_SCORE for idx in HIP_KPS)
 
-        # fallback 到检测框高度
-        if estimated_height is None or estimated_height <= 0:
+        if has_hip:
+            # 全身入镜，计算距离
+            estimated_height, est_method = self.estimate_full_height(kps)
+            if estimated_height is None or estimated_height <= 0:
+                estimated_height = y2 - y1
+                est_method = "bbox_fallback"
+            distance = (PERSON_REAL_HEIGHT * self.fy) / estimated_height
+        else:
+            # 半身/只有上半身，不计算距离（直接丢弃距离）
             estimated_height = y2 - y1
-            est_method = "bbox_fallback"
-
-        # 测距
-        distance = (PERSON_REAL_HEIGHT * self.fy) / estimated_height
+            est_method = "half_body"
+            distance = None
 
         return {
             'idx': best_idx,
@@ -340,7 +353,7 @@ class PersonTrackerKeypointApp(AIBase):
 
                     # 绘制关键点
                     for k in range(17):
-                        if kps[k][2] > 0.15:
+                        if kps[k][2] > MIN_KP_SCORE:
                             kx = int(kps[k][0] * self.display_size[0] // self.rgb888p_size[0])
                             ky = int(kps[k][1] * self.display_size[1] // self.rgb888p_size[1])
                             color = (255, 255, 0, 0) if is_target else (255, 0, 255, 0)
@@ -350,7 +363,7 @@ class PersonTrackerKeypointApp(AIBase):
                     for k in range(len(self.SKELETON)):
                         ske = self.SKELETON[k]
                         idx1, idx2 = ske[0] - 1, ske[1] - 1
-                        if kps[idx1][2] > 0.15 and kps[idx2][2] > 0.15:
+                        if kps[idx1][2] > MIN_KP_SCORE and kps[idx2][2] > MIN_KP_SCORE:
                             x1_ = int(kps[idx1][0] * self.display_size[0] // self.rgb888p_size[0])
                             y1_ = int(kps[idx1][1] * self.display_size[1] // self.rgb888p_size[1])
                             x2_ = int(kps[idx2][0] * self.display_size[0] // self.rgb888p_size[0])
@@ -367,11 +380,11 @@ class PersonTrackerKeypointApp(AIBase):
                         h = int((y2 - y1) * self.display_size[1] // self.rgb888p_size[1])
                         pl.osd_img.draw_rectangle(sx, sy, w, h, color=(255, 255, 0, 0), thickness=2)
 
-                        label = "Dist:%.2fm" % person_info['distance']
+                        if person_info['distance'] is not None:
+                            label = "Dist:%.2fm" % person_info['distance']
+                        else:
+                            label = "HalfBody"
                         pl.osd_img.draw_string_advanced(sx, sy - 40, 28, label, color=(255, 255, 0, 0))
-
-                            # 显示推算信息（已移到左上角，避免目标框在顶部时出界）
-                        pass
 
             # 画面中心十字
             center_x = int(self.cx * self.display_size[0] // self.rgb888p_size[0])
@@ -380,10 +393,13 @@ class PersonTrackerKeypointApp(AIBase):
 
             # 控制信息（左上角固定位置，不会出界）
             if person_info:
-                info_str = "Dist:%.2fm Omega:%.2f" % (
-                    person_info['distance'],
-                    person_info.get('omega', 0)
-                )
+                if person_info['distance'] is not None:
+                    info_str = "Dist:%.2fm Omega:%.2f" % (
+                        person_info['distance'],
+                        person_info.get('omega', 0)
+                    )
+                else:
+                    info_str = "HalfBody Omega:%.2f" % person_info.get('omega', 0)
                 pl.osd_img.draw_string_advanced(10, 10, 28, info_str, color=(255, 255, 255, 0))
 
                 # 调试信息：估算高度 + 方法
